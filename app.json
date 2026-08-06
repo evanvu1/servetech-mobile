@@ -1,0 +1,17 @@
+{
+  "expo": {
+    "name": "ServeTech",
+    "slug": "servetech",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "servetech",
+    "userInterfaceStyle": "light",
+    "ios": { "supportsTablet": true, "bundleIdentifier": "com.servetech.app" },
+    "android": { "package": "com.servetech.app", "predictiveBackGestureEnabled": false },
+    "plugins": [
+      "expo-router",
+      ["expo-image-picker", { "photosPermission": "Allow ServeTech to choose a serve video for analysis.", "cameraPermission": "Allow ServeTech to record your serve." }]
+    ],
+    "experiments": { "typedRoutes": true }
+  }
+}
