@@ -7,15 +7,15 @@ import { setEngineFullscreen, startEngineReview, subscribeReviewEvents, type Rev
 // title/progress/play-button chrome. This screen just starts the replay and
 // advances to /results once the engine reports it's finished.
 export default function ReviewScreen() {
-  const { uri } = useLocalSearchParams<{ uri?: string }>();
+  const { uri, trimStart, trimEnd } = useLocalSearchParams<{ uri?: string; trimStart?: string; trimEnd?: string }>();
   const started = useRef(false);
   useEffect(() => {
     setEngineFullscreen(true);
     const unsubscribe = subscribeReviewEvents((e: ReviewEvent) => {
-      if (e.type === "reviewDone") router.replace({ pathname: "/results", params: { uri } });
+      if (e.type === "reviewDone") router.replace({ pathname: "/results", params: { uri, trimStart, trimEnd } });
     });
     if (!started.current) { started.current = true; startEngineReview(); }
     return () => { unsubscribe(); setEngineFullscreen(false); };
-  }, [uri]);
+  }, [uri, trimStart, trimEnd]);
   return null;
 }
