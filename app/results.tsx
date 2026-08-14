@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
-import { Check, ChevronLeft, Lightbulb, Play, RotateCcw, Save } from "lucide-react-native";
+import { Check, Lightbulb, Play, RotateCcw, Save, X } from "lucide-react-native";
 import { router, useLocalSearchParams } from "expo-router";
 import { Screen } from "@/components/Screen";
 import { AppButton } from "@/components/AppButton";
@@ -26,7 +26,7 @@ export default function ResultsScreen(){const {uri,id,trimStart,trimEnd}=useLoca
     try{await saveToHistory(analysis,uri,{start:Number(trimStart)||0,end:Number(trimEnd)||0});setSaved(true);}
     finally{setSaving(false);}
   }
-  return <Screen contentContainerStyle={styles.screen}><View style={styles.top}><Pressable onPress={()=>router.replace("/(tabs)")} accessibilityLabel="Back to profile" style={styles.back}><ChevronLeft size={22} color={colors.text}/></Pressable><Text style={styles.topTitle}>Serve analysis</Text><View style={{width:44}}/></View>
+  return <Screen contentContainerStyle={styles.screen}><View style={styles.top}><Pressable onPress={()=>router.replace("/(tabs)")} accessibilityLabel="Close and return to profile" style={styles.back}><X size={20} color={colors.text}/></Pressable><Text style={styles.topTitle}>Serve analysis</Text><View style={{width:44}}/></View>
   <View style={styles.scoreRow}><View><Text style={styles.kicker}>OVERALL SCORE</Text><Text style={styles.score}>{analysis.overallScore}<Text style={styles.outOf}> / 100</Text></Text><Text style={styles.scoreLabel}>Strong foundation</Text></View><View style={styles.scoreRing}><Text style={styles.scoreRingText}>{analysis.overallScore}</Text></View></View>
   <Text style={styles.sectionTitle}>Your serve</Text><View style={styles.videoWrap}><VideoCard uri={videoUri}/>{!id&&uri&&<Pressable style={styles.replayBtn} onPress={()=>router.push({pathname:"/review",params:{uri}})}><Play size={16} color={colors.text} fill={colors.text}/><Text style={styles.replayText}>Watch the breakdown again</Text></Pressable>}</View>
   <View style={styles.correction}><Text style={styles.correctionKicker}>MOST IMPORTANT CORRECTION</Text><Text style={styles.correctionTitle}>{analysis.correction.title}</Text><Text style={styles.correctionText}>{analysis.correction.detail}</Text></View>

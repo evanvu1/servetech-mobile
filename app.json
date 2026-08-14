@@ -6,12 +6,38 @@
     "orientation": "portrait",
     "scheme": "servegoat",
     "userInterfaceStyle": "light",
-    "ios": { "supportsTablet": true, "bundleIdentifier": "com.servegoat.app" },
-    "android": { "package": "com.servegoat.app", "predictiveBackGestureEnabled": false },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.servegoat.app",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "android": {
+      "package": "com.servegoat.app",
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.RECORD_AUDIO"
+      ]
+    },
     "plugins": [
       "expo-router",
-      ["expo-image-picker", { "photosPermission": "Allow Serve Goat to choose a serve video for analysis.", "cameraPermission": "Allow Serve Goat to record your serve." }]
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow Serve Goat to choose a serve video for analysis.",
+          "cameraPermission": "Allow Serve Goat to record your serve."
+        }
+      ]
     ],
-    "experiments": { "typedRoutes": true }
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "d322b859-0a01-45d5-a76b-1ed242990eef"
+      }
+    }
   }
 }

@@ -996,10 +996,18 @@ let racquetDetector = null;
 let lastDetectTime = -1;
 let busy = false;
 
-// Reused offscreen canvas for capturing a downscaled still of each analyzed
-// frame (see onFrame below) — kept small since only the 5 checkpoint frames
-// survive past runAnalysis (see the prune step after keyframes are known).
-const SNAP_MAX_DIM = 480;
+// Reused offscreen canvas for capturing a still of each analyzed frame (see
+// onFrame below). Every sampled frame holds one of these simultaneously
+// until the prune step right after keyframes are known (see runAnalysis),
+// so this can't be unbounded — but 720 (tried first) was still a visible
+// upscale on review pause for any 1080p+ source, since drawStop stretches
+// this same still up to the video's native canvas size. 1920 means anything
+// up to 1080p landscape (the common case here, given the "record landscape"
+// guidance) gets captured 1:1 — no upscale at all at review time — and only
+// actual 4K+ sources get downsampled. Trades more transient memory during
+// the frame-capture walk for a real fix on typical footage; acceptable
+// since trimmed serve clips run a few seconds, not minutes.
+const SNAP_MAX_DIM = 1920;
 const snapCanvas = document.createElement("canvas");
 const snapCtx = snapCanvas.getContext("2d");
 
@@ -1169,7 +1177,7 @@ async function runAnalysis({ videoSrc, arm, serveType, trimStart, trimEnd }) {
       snapCanvas.width = Math.max(1, Math.round(video.videoWidth * snapScale));
       snapCanvas.height = Math.max(1, Math.round(video.videoHeight * snapScale));
       snapCtx.drawImage(video, 0, 0, snapCanvas.width, snapCanvas.height);
-      entry.img = snapCanvas.toDataURL("image/jpeg", 0.7);
+      entry.img = snapCanvas.toDataURL("image/jpeg", 0.88);
       if (racquetDetector) {
         for (const d of racquetDetector.detectForVideo(video, ts).detections) {
           entry.rq.push({
