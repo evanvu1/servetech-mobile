@@ -1,16 +1,16 @@
 {
   "expo": {
-    "name": "ServeTech",
-    "slug": "servetech",
+    "name": "Serve Goat",
+    "slug": "servegoat",
     "version": "1.0.0",
     "orientation": "portrait",
-    "scheme": "servetech",
+    "scheme": "servegoat",
     "userInterfaceStyle": "light",
-    "ios": { "supportsTablet": true, "bundleIdentifier": "com.servetech.app" },
-    "android": { "package": "com.servetech.app", "predictiveBackGestureEnabled": false },
+    "ios": { "supportsTablet": true, "bundleIdentifier": "com.servegoat.app" },
+    "android": { "package": "com.servegoat.app", "predictiveBackGestureEnabled": false },
     "plugins": [
       "expo-router",
-      ["expo-image-picker", { "photosPermission": "Allow ServeTech to choose a serve video for analysis.", "cameraPermission": "Allow ServeTech to record your serve." }]
+      ["expo-image-picker", { "photosPermission": "Allow Serve Goat to choose a serve video for analysis.", "cameraPermission": "Allow Serve Goat to record your serve." }]
     ],
     "experiments": { "typedRoutes": true }
   }

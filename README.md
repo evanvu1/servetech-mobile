@@ -1,4 +1,4 @@
-# ServeTech Mobile
+# Serve Goat Mobile
 
 Native iOS and Android frontend built with Expo, React Native, TypeScript, and Expo Router.
 

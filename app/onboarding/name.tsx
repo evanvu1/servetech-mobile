@@ -1,0 +1,13 @@
+import { useRef, useState } from "react";
+import { Keyboard, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { router } from "expo-router";
+import { AppButton } from "@/components/AppButton";
+import { colors, radius, spacing, typography } from "@/constants/theme";
+import { saveProfile } from "@/services/userStore";
+export default function NameScreen(){const [firstName,setFirstName]=useState("");const [lastName,setLastName]=useState("");const lastNameRef=useRef<TextInput>(null);
+  function next(){saveProfile({firstName:firstName.trim(),lastName:lastName.trim()});router.replace("/(tabs)")}
+  return <KeyboardAvoidingView style={styles.safe} behavior={Platform.OS==="ios"?"padding":undefined}><Pressable style={styles.fill} onPress={Keyboard.dismiss} accessible={false}><View style={styles.body}><Text style={styles.kicker}>ALMOST THERE</Text><Text style={styles.title}>What's your name?</Text><Text style={styles.subtitle}>This is how you'll show up in Serve Goat.</Text>
+    <View style={styles.field}><Text style={styles.label}>First name</Text><TextInput value={firstName} onChangeText={setFirstName} placeholder="Jane" placeholderTextColor={colors.muted} autoCapitalize="words" autoCorrect={false} returnKeyType="next" onSubmitEditing={()=>lastNameRef.current?.focus()} style={styles.input}/></View>
+    <View style={styles.field}><Text style={styles.label}>Last name</Text><TextInput ref={lastNameRef} value={lastName} onChangeText={setLastName} placeholder="Doe" placeholderTextColor={colors.muted} autoCapitalize="words" autoCorrect={false} returnKeyType="done" onSubmitEditing={()=>Keyboard.dismiss()} style={styles.input}/></View>
+  </View><AppButton label="Continue" onPress={next} disabled={!firstName.trim()||!lastName.trim()}/></Pressable></KeyboardAvoidingView>}
+const styles=StyleSheet.create({safe:{flex:1,backgroundColor:colors.background},fill:{flex:1,paddingHorizontal:spacing.xl,paddingTop:spacing.huge,paddingBottom:spacing.xxl,justifyContent:"space-between"},body:{flex:1},kicker:{fontSize:11,fontWeight:"900",letterSpacing:1.7,color:colors.muted},title:{fontSize:typography.title,fontWeight:"900",color:colors.text,letterSpacing:-1,marginTop:4},subtitle:{fontSize:typography.body,lineHeight:23,color:colors.muted,marginTop:spacing.sm,marginBottom:spacing.xxl},field:{marginBottom:spacing.lg},label:{fontSize:13,fontWeight:"800",color:colors.text,marginBottom:spacing.sm},input:{minHeight:54,borderWidth:1,borderColor:colors.border,borderRadius:radius.md,paddingHorizontal:spacing.lg,fontSize:16,color:colors.text,backgroundColor:colors.white}});

@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>ServeTech Analyzer Engine</title>
+<title>Serve Goat Analyzer Engine</title>
 <style>
   /* Visibility is entirely up to the host app: during the hidden analysis
      pass, RN sizes this WebView to ~0px; during the guided review it's
@@ -55,27 +55,27 @@ const TUNE = {
   // only to catch a landmark glitch, not to flag genuinely deep knee bend.
   kneeMin: 60,
   kneeMax: 135,           // matches the trophy-position coaching advice (115–135°)
-  kneeSlope: 0.15,        // penalty per degree short of kneeMax
+  kneeSlope: 0.21,        // penalty per degree short of kneeMax
   tossElbMin: 172,        // toss-arm elbow angle that counts as "straight"
-  tossElbSlope: 0.2,      // penalty per degree below tossElbMin
+  tossElbSlope: 0.28,     // penalty per degree below tossElbMin
   tossDevMax: 20,         // toss arm lean off vertical allowed (degrees)
-  tossDevSlope: 0.15,     // penalty per degree beyond tossDevMax
+  tossDevSlope: 0.21,     // penalty per degree beyond tossDevMax
   // Load/Trophy checkpoint grades knee/toss-arm/hitting-arm against an ideal
   // center rather than a pass/fail cutoff (see cpLoadTrophy), so a clean
   // serve still loses a touch instead of maxing out at 10.
   kneeIdeal: 100,          // knee angle graded as "ideal" depth; deeper costs nothing
-  kneeCenterSlope: 0.045,  // penalty per degree straighter than kneeIdeal
-  tossElbCenterSlope: 0.045,// penalty per degree short of full extension (180°)
+  kneeCenterSlope: 0.062,  // penalty per degree straighter than kneeIdeal
+  tossElbCenterSlope: 0.062,// penalty per degree short of full extension (180°)
   hitElbIdeal: 30,         // hitting-arm elbow angle graded as "ideal" bend; more bent costs nothing
-  hitElbCenterSlope: 0.03, // penalty per degree straighter than hitElbIdeal
+  hitElbCenterSlope: 0.042,// penalty per degree straighter than hitElbIdeal
   kickTarget: 0.25,       // back-ankle rise over landing ankle (torso units)
-  kickSlope: 30,          // penalty per torso-unit short of kickTarget
+  kickSlope: 42,          // penalty per torso-unit short of kickTarget
   rqMaxWristDist: 0.30,   // racquet box must be this close to the hitting wrist
   rqDropTarget: 0.5,      // racquet head this far below wrist at drop (torso units)
-  rqDropSlope: 16,        // penalty per torso-unit short of rqDropTarget
+  rqDropSlope: 22,        // penalty per torso-unit short of rqDropTarget
   rqContactWindow: 5,     // frames around contact searched for the racquet peak (grading only)
   rqContactTarget: 85,    // racquet peak as % of standing reach near contact
-  rqContactSlope: 0.3,    // penalty per % short of rqContactTarget
+  rqContactSlope: 0.42,   // penalty per % short of rqContactTarget
   contactFrameBias: 0     // flat frame shift applied to the detected CONTACT frame (see analyzeServe) — even 1 frame overshot on low-fps clips, back to the raw pick
 };
 
@@ -165,7 +165,7 @@ const ServeScoring = (() => {
       const align = Math.abs(lineAngle(fS, IDX.L_SHOULDER, IDX.R_SHOULDER) -
                              lineAngle(fS, IDX.L_ANKLE, IDX.R_ANKLE));
       const stagger = Math.abs(pt(fS, IDX.L_ANKLE).x - pt(fS, IDX.R_ANKLE).x) / hipW;
-      const pen = 0.2 * Math.max(0, align - 5) + 4.0 * outside(stagger, 0.8, 1.2);
+      const pen = 0.28 * Math.max(0, align - 5) + 5.5 * outside(stagger, 0.8, 1.2);
       return {
         score: finalizeScore(pen),
         detail: `shoulders ${align.toFixed(1)}° off stance line, stagger ${stagger.toFixed(2)}× hip width`
@@ -239,13 +239,13 @@ const ServeScoring = (() => {
     function cpContact() {
       const reach = (pt(fS, SHO).h - ground) + armReach;
       const reachPct = (pt(fC, WRI).h - ground) / reach * 100;
-      const penReach = 0.5 * Math.max(0, 95 - reachPct);
+      const penReach = 0.7 * Math.max(0, 95 - reachPct);
       // raw (unsmoothed) elbow near contact — smoothing understates the fast extension
       let elb = 0;
       for (let i = Math.max(0, C - 1); i <= Math.min(n - 1, C + 1); i++) {
         elb = Math.max(elb, jointAngleDeg(frames[i], SHO, ELB, WRI));
       }
-      const penElb = 0.2 * Math.max(0, 165 - elb);
+      const penElb = 0.28 * Math.max(0, 165 - elb);
       // racquet peak height near contact — real detections only, since the
       // blur-gap interpolation can't be trusted for grading
       let rqPct = null;
@@ -288,7 +288,7 @@ const ServeScoring = (() => {
       const w = pt(fF, WRI);
       const cross = ((w.x - hipC.x) * ux + (w.h - hipC.h) * uh) / hipW;
       const above = (w.h - hipC.h) / hipW;
-      let pen = 5.0 * Math.max(0, -cross) + 2.5 * Math.max(0, above);
+      let pen = 6.9 * Math.max(0, -cross) + 3.5 * Math.max(0, above);
       // abrupt deceleration check: biggest single-frame fractional speed drop
       let prevSpeed = null, maxDrop = 0;
       for (let i = C; i <= Math.min(F + 3, n - 1); i++) {
@@ -301,7 +301,7 @@ const ServeScoring = (() => {
         }
         prevSpeed = sp;
       }
-      if (maxDrop > 0.8) pen += 1.3;
+      if (maxDrop > 0.8) pen += 1.8;
       const crossTxt = cross >= 0
         ? `crossed ${cross.toFixed(1)} hip-widths past midline`
         : `${(-cross).toFixed(1)} hip-widths short of midline`;
@@ -339,7 +339,7 @@ const ServeScoring = (() => {
       sway /= hipW;
       const shoe = Math.max(segLen(fS, NHEEL, NFOOT), 1e-3);
       const drift = Math.abs(pt(frames[land], NANK).x - pt(fS, NANK).x) / shoe;
-      const pen = 6.5 * Math.max(0, sway - 0.25) + 0.4 * Math.max(0, drift - 1.0);
+      const pen = 9.0 * Math.max(0, sway - 0.25) + 0.55 * Math.max(0, drift - 1.0);
       return {
         score: finalizeScore(pen),
         detail: `landed by ${frames[land].t.toFixed(2)}s, sway ${sway.toFixed(2)} hip-widths, front-foot drift ${drift.toFixed(1)} shoe-lengths`
@@ -353,8 +353,8 @@ const ServeScoring = (() => {
       { name: "Racket Drop",             weight: 15, ...cpRacketDrop() },
       { name: "Hip-Shoulder Separation", weight: 12, ...cpSeparation() },
       { name: "Contact Point",           weight: 13, ...cpContact() },
-      { name: "Pronation / Wrist Snap",  weight: 10, ...cpPronation() },
-      { name: "Follow-Through",          weight: 8,  ...cpFollowThrough() },
+      { name: "Pronation / Wrist Snap",  weight: 6,  ...cpPronation() },
+      { name: "Follow-Through",          weight: 12, ...cpFollowThrough() },
       { name: "Landing Balance",         weight: 5,  ...cpLanding() }
     ];
 
@@ -592,16 +592,16 @@ function analyzeServe(frames, arm, racquet = null) {
   }
 
   // --- DROP: back-scratch racquet drop. Primary signal is the racquet head
-  // itself — take the lowest (max-y) real, non-interpolated detection in the
-  // load→contact window, since that's literally what "the drop" is. Elbow-
-  // fold (angle bottoms out, then re-extends past 90°) is kept as a fallback
-  // for clips/windows where no real detection lands in that stretch — this
-  // exact window is where detection is documented weakest (edge-on racquet,
-  // fast motion) on the reference clip, so it can't be assumed to always be
-  // covered. Validated against 3 labeled clips: racquet-tip beat the elbow-
-  // fold heuristic on 2 of 3, and was only marginally worse on the third
-  // (0.08s vs 0.02s) — no fallback was needed on any of the three, but the
-  // fallback exists for clips where coverage is worse. ---
+  // itself — take the lowest (max-y) real, non-interpolated detection, since
+  // that's literally what "the drop" is. Elbow-fold (angle bottoms out, then
+  // re-extends past 90°) is kept as a fallback for clips/windows where no
+  // real detection lands in that stretch — this exact window is where
+  // detection is documented weakest (edge-on racquet, fast motion) on the
+  // reference clip, so it can't be assumed to always be covered. Validated
+  // against 3 labeled clips: racquet-tip beat the elbow-fold heuristic on 2
+  // of 3, and was only marginally worse on the third (0.08s vs 0.02s) — no
+  // fallback was needed on any of the three, but the fallback exists for
+  // clips where coverage is worse. ---
   const fold = contact > load ? argmin(elbowAngle, load, contact) : load;
   let dropFallback = Math.floor((fold + contact) / 2);
   for (let i = fold; i <= contact; i++) {
@@ -609,13 +609,41 @@ function analyzeServe(frames, arm, racquet = null) {
   }
   let drop = dropFallback;
   if (racquet) {
-    let bestY = -Infinity, found = false;
+    // Real (non-interpolated) detections only, in frame order.
+    const real = [];
     for (let i = load; i <= contact; i++) {
       const r = racquet[i];
-      if (!r || r.interp) continue;
-      if (r.head.y > bestY) { bestY = r.head.y; drop = i; found = true; }
+      if (r && !r.interp) real.push({ i, y: r.head.y });
     }
-    if (!found) drop = dropFallback;
+    if (real.length) {
+      // Some players carry the racquet low right after the toss, before
+      // starting their actual back-scratch drop — a plain "lowest point
+      // across the whole load→contact window" search then locks onto that
+      // low carry instead of the real drop later on (2026-08-14, real user
+      // report + clip: drop was landing exactly on load). Skip past it by
+      // finding the first *sustained* rise after load — 2 consecutive real
+      // detections both higher (smaller y) than a candidate — and only
+      // searching for the deepest point from there on. A plain single-frame
+      // "next reading is higher" check isn't enough: real detections are
+      // noisy enough (score varies frame to frame) that a one-frame blip
+      // mid-descent falsely triggers it, same reason windupGate below
+      // requires a sustained move rather than a single-frame one. This is a
+      // no-op whenever load is already the top of a monotonic descent into
+      // the drop (the classic-technique case, e.g. the reference clip) — the
+      // very first candidate already qualifies as "the rise," so the search
+      // covers the same full window as before. Re-verified against the 9
+      // previously-validated clips: identical picks on all 9; only the
+      // low-carry clip's pick moved, landing within ~0.02s of the visually
+      // confirmed drop frame.
+      let apexIdx = 0;
+      for (let k = 0; k < real.length - 2; k++) {
+        if (real[k + 1].y > real[k].y && real[k + 2].y > real[k].y) { apexIdx = k; break; }
+      }
+      let bestY = -Infinity;
+      for (let k = apexIdx; k < real.length; k++) {
+        if (real[k].y > bestY) { bestY = real[k].y; drop = real[k].i; }
+      }
+    }
   }
 
   // --- FINISH: follow-through — hitting hand below the shoulder (across the
