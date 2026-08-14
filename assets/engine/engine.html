@@ -1,0 +1,1307 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ServeTech Analyzer Engine</title>
+<style>
+  /* Visibility is entirely up to the host app: during the hidden analysis
+     pass, RN sizes this WebView to ~0px; during the guided review it's
+     resized full-screen. The video/canvas here just always render at their
+     natural size within whatever box they're given — no separate
+     hide/show state to keep in sync on this side.
+     No object-fit on the video: its rendered box is left to size itself
+     naturally (display:block, capped by max-width/max-height), and #stage
+     shrinks to fit that same box, so #overlay's 100%/100% exactly matches
+     the video's box with no independent scaling math. */
+  html, body { margin: 0; padding: 0; height: 100%; background: #000; }
+  body { display: flex; align-items: center; justify-content: center; }
+  #stage { position: relative; }
+  video { display: block; max-width: 100vw; max-height: 100vh; }
+  #overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" playsinline muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+<script type="module">
+import {
+  PoseLandmarker,
+  ObjectDetector,
+  FilesetResolver
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+/* ============================================================
+ * Scoring/keyframe core — copied verbatim from ServeTech's
+ * pose-viewer.html (rubric v0.1 + tuned CONTACT/DROP/SETUP
+ * heuristics). Keep this block in sync with pose-viewer.html by
+ * re-copying rather than hand-editing in two places.
+ * ============================================================ */
+
+const LM = {
+  L_SHOULDER: 11, R_SHOULDER: 12,
+  L_ELBOW: 13, R_ELBOW: 14,
+  L_WRIST: 15, R_WRIST: 16,
+  L_HIP: 23, R_HIP: 24,
+  L_KNEE: 25, R_KNEE: 26,
+  L_ANKLE: 27, R_ANKLE: 28
+};
+
+const TUNE = {
+  // Knee angle at trophy: only penalize NOT bending enough (angle above
+  // kneeMax — legs too straight). A deep bend (low angle) is good, not bad,
+  // so kneeMin is set low enough to essentially never trigger — it exists
+  // only to catch a landmark glitch, not to flag genuinely deep knee bend.
+  kneeMin: 60,
+  kneeMax: 135,           // matches the trophy-position coaching advice (115–135°)
+  kneeSlope: 0.15,        // penalty per degree short of kneeMax
+  tossElbMin: 172,        // toss-arm elbow angle that counts as "straight"
+  tossElbSlope: 0.2,      // penalty per degree below tossElbMin
+  tossDevMax: 20,         // toss arm lean off vertical allowed (degrees)
+  tossDevSlope: 0.15,     // penalty per degree beyond tossDevMax
+  // Load/Trophy checkpoint grades knee/toss-arm/hitting-arm against an ideal
+  // center rather than a pass/fail cutoff (see cpLoadTrophy), so a clean
+  // serve still loses a touch instead of maxing out at 10.
+  kneeIdeal: 100,          // knee angle graded as "ideal" depth; deeper costs nothing
+  kneeCenterSlope: 0.045,  // penalty per degree straighter than kneeIdeal
+  tossElbCenterSlope: 0.045,// penalty per degree short of full extension (180°)
+  hitElbIdeal: 30,         // hitting-arm elbow angle graded as "ideal" bend; more bent costs nothing
+  hitElbCenterSlope: 0.03, // penalty per degree straighter than hitElbIdeal
+  kickTarget: 0.25,       // back-ankle rise over landing ankle (torso units)
+  kickSlope: 30,          // penalty per torso-unit short of kickTarget
+  rqMaxWristDist: 0.30,   // racquet box must be this close to the hitting wrist
+  rqDropTarget: 0.5,      // racquet head this far below wrist at drop (torso units)
+  rqDropSlope: 16,        // penalty per torso-unit short of rqDropTarget
+  rqContactWindow: 5,     // frames around contact searched for the racquet peak (grading only)
+  rqContactTarget: 85,    // racquet peak as % of standing reach near contact
+  rqContactSlope: 0.3,    // penalty per % short of rqContactTarget
+  contactFrameBias: 0     // flat frame shift applied to the detected CONTACT frame (see analyzeServe) — even 1 frame overshot on low-fps clips, back to the raw pick
+};
+
+/* ---------------- Serve scoring (rubric v0.1) ---------------- */
+
+/* Serve scoring module — rubric v0.1.
+ * Scores checkpoints from recorded landmark frames, detected keyframes, and
+ * (when available) the racquet track. Pronation needs racquet orientation
+ * through contact and returns null for now; the final score re-normalizes
+ * weights across the checkpoints that actually produced a score.
+ *
+ * Camera-view notes (calibrated on behind-the-server footage):
+ * - Hip width is unusable as a normalizer when hips are edge-on, so body-scale
+ *   units use torso length (shoulder-center to hip-center); "hip width" is
+ *   approximated as 0.7 × torso.
+ * - Load/Trophy sub-penalties are each capped at 3.0 because foreshortened
+ *   limbs make single sub-metrics unreliable from some camera angles.
+ */
+const ServeScoring = (() => {
+  const IDX = {
+    NOSE: 0,
+    L_SHOULDER: 11, R_SHOULDER: 12,
+    L_ELBOW: 13, R_ELBOW: 14,
+    L_WRIST: 15, R_WRIST: 16,
+    L_HIP: 23, R_HIP: 24,
+    L_KNEE: 25, R_KNEE: 26,
+    L_ANKLE: 27, R_ANKLE: 28,
+    L_HEEL: 29, R_HEEL: 30,
+    L_FOOT: 31, R_FOOT: 32
+  };
+
+  const clip = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  const round1 = v => Math.round(v * 10) / 10;
+  const finalizeScore = pen => round1(clip(10 - pen, 1, 10));
+  // distance outside an [lo, hi] window (0 inside it)
+  const outside = (v, lo, hi) => (v < lo ? lo - v : v > hi ? v - hi : 0);
+
+  function pt(frame, k) {
+    const p = frame.lm[k];
+    return { x: p.x, h: 1 - p.y }; // h: up-positive height
+  }
+  function segLen(frame, a, b) {
+    const pa = pt(frame, a), pb = pt(frame, b);
+    return Math.hypot(pa.x - pb.x, pa.h - pb.h);
+  }
+  // angle of the line a-b vs horizontal, folded to 0..90
+  function lineAngle(frame, a, b) {
+    const pa = pt(frame, a), pb = pt(frame, b);
+    let ang = Math.abs(Math.atan2(pb.h - pa.h, pb.x - pa.x) * 180 / Math.PI);
+    return Math.min(ang, 180 - ang);
+  }
+  function jointAngleDeg(frame, a, b, c) {
+    const lm = frame.lm;
+    const v1x = lm[a].x - lm[b].x, v1y = lm[a].y - lm[b].y;
+    const v2x = lm[c].x - lm[b].x, v2y = lm[c].y - lm[b].y;
+    const mag = Math.hypot(v1x, v1y) * Math.hypot(v2x, v2y);
+    if (mag === 0) return 180;
+    return Math.acos(clip((v1x * v2x + v1y * v2y) / mag, -1, 1)) * 180 / Math.PI;
+  }
+
+  function scoreServe(frames, kf, arm, serveType = "flat", racquet = null) {
+    const n = frames.length;
+    const right = arm === "right";
+    const SHO = right ? IDX.R_SHOULDER : IDX.L_SHOULDER;
+    const NSHO = right ? IDX.L_SHOULDER : IDX.R_SHOULDER;
+    const ELB = right ? IDX.R_ELBOW : IDX.L_ELBOW;
+    const WRI = right ? IDX.R_WRIST : IDX.L_WRIST;
+    const NELB = right ? IDX.L_ELBOW : IDX.R_ELBOW;
+    const NWRI = right ? IDX.L_WRIST : IDX.R_WRIST;
+    const NANK = right ? IDX.L_ANKLE : IDX.R_ANKLE;
+    const NHEEL = right ? IDX.L_HEEL : IDX.R_HEEL;
+    const NFOOT = right ? IDX.L_FOOT : IDX.R_FOOT;
+
+    const S = kf.setup, L = kf.load, D = kf.drop, C = kf.contact, F = kf.finish;
+    const fS = frames[S], fL = frames[L], fD = frames[D], fC = frames[C], fF = frames[F];
+
+    // body-scale references
+    const torso = (segLen(fS, IDX.L_SHOULDER, IDX.L_HIP) +
+                   segLen(fS, IDX.R_SHOULDER, IDX.R_HIP)) / 2;
+    const hipW = 0.7 * torso; // projected hip width is view-dependent; use anatomy
+    let armReach = 0;
+    for (const f of frames) armReach = Math.max(armReach, segLen(f, SHO, WRI));
+    const ground = (pt(fS, IDX.L_ANKLE).h + pt(fS, IDX.R_ANKLE).h) / 2;
+
+    /* --- 1. Setup & Alignment (5%) --- */
+    function cpSetup() {
+      const align = Math.abs(lineAngle(fS, IDX.L_SHOULDER, IDX.R_SHOULDER) -
+                             lineAngle(fS, IDX.L_ANKLE, IDX.R_ANKLE));
+      const stagger = Math.abs(pt(fS, IDX.L_ANKLE).x - pt(fS, IDX.R_ANKLE).x) / hipW;
+      const pen = 0.2 * Math.max(0, align - 5) + 4.0 * outside(stagger, 0.8, 1.2);
+      return {
+        score: finalizeScore(pen),
+        detail: `shoulders ${align.toFixed(1)}° off stance line, stagger ${stagger.toFixed(2)}× hip width`
+      };
+    }
+
+    /* --- 2. Ball Toss (12%) — excluded from grading --- */
+    function cpToss() {
+      return { score: null, detail: "excluded from grading" };
+    }
+
+    /* --- 3. Loading & Trophy Position (20%) --- */
+    // Graded against an ideal center rather than a pass/fail cutoff, so even
+    // clean form loses a touch — nothing maxes out at 10 just by clearing a
+    // bar. Still one-directional per limb (deep knees / bent hitting arm /
+    // straight toss arm are never penalized for going further, only falling
+    // short costs).
+    function cpLoadTrophy() {
+      const CAP = 3.0; // per-sub-metric cap: foreshortening can spike any one reading
+
+      // Knees relatively bent — ideal is a deep bend; straighter than ideal costs.
+      const knee = (jointAngleDeg(fL, IDX.L_HIP, IDX.L_KNEE, IDX.L_ANKLE) +
+                    jointAngleDeg(fL, IDX.R_HIP, IDX.R_KNEE, IDX.R_ANKLE)) / 2;
+      const penKnee = Math.min(CAP, TUNE.kneeCenterSlope * Math.max(0, knee - TUNE.kneeIdeal));
+
+      // Toss arm relatively straight — ideal is full extension (180°).
+      const tossElb = jointAngleDeg(fL, NSHO, NELB, NWRI);
+      const penTossArm = Math.min(CAP, TUNE.tossElbCenterSlope * Math.max(0, 180 - tossElb));
+
+      // Hitting arm relatively bent — ideal is a well-folded elbow; straighter than ideal costs.
+      const hitElb = jointAngleDeg(fL, SHO, ELB, WRI);
+      const penHitArm = Math.min(CAP, TUNE.hitElbCenterSlope * Math.max(0, hitElb - TUNE.hitElbIdeal));
+
+      return {
+        score: finalizeScore(penKnee + penTossArm + penHitArm),
+        // Side labels here are deliberate: this is the one checkpoint where
+        // both arms show up in the same detail line, so it's the clearest
+        // place to confirm the selected hitting arm actually changed which
+        // physical arm got graded as which role.
+        detail: `knees ${knee.toFixed(0)}°, toss arm (${right ? "left" : "right"}) ${tossElb.toFixed(0)}° at elbow, hitting arm (${right ? "right" : "left"}) ${hitElb.toFixed(0)}° at elbow`
+      };
+    }
+
+    /* --- 4. Racket Drop (15%) — depth of the back-scratch drop --- */
+    function cpRacketDrop() {
+      if (!racquet) return { score: null, detail: "racquet tracking unavailable" };
+      // deepest head-below-wrist reading around the DROP keyframe, torso units
+      let best = null;
+      for (let i = Math.max(0, D - 3); i <= Math.min(n - 1, D + 3); i++) {
+        const r = racquet[i];
+        if (!r) continue;
+        const drop = (r.head.y - frames[i].lm[WRI].y) / torso;
+        if (best === null || drop > best.drop) best = { drop, interp: r.interp };
+      }
+      if (!best) return { score: null, detail: "racquet not detected around the drop" };
+      const pen = TUNE.rqDropSlope * Math.max(0, TUNE.rqDropTarget - best.drop);
+      return {
+        score: finalizeScore(pen),
+        detail: `racquet head ${best.drop.toFixed(2)} torso-lengths below the wrist ` +
+                `at drop (target ≥ ${TUNE.rqDropTarget})` +
+                (best.interp ? " — interpolated between detections" : "")
+      };
+    }
+
+    /* --- 5. Hip-Shoulder Separation (12%) — excluded from grading --- */
+    function cpSeparation() {
+      return { score: null, detail: "excluded from grading" };
+    }
+
+    /* --- 6. Contact Point (13%) --- */
+    function cpContact() {
+      const reach = (pt(fS, SHO).h - ground) + armReach;
+      const reachPct = (pt(fC, WRI).h - ground) / reach * 100;
+      const penReach = 0.5 * Math.max(0, 95 - reachPct);
+      // raw (unsmoothed) elbow near contact — smoothing understates the fast extension
+      let elb = 0;
+      for (let i = Math.max(0, C - 1); i <= Math.min(n - 1, C + 1); i++) {
+        elb = Math.max(elb, jointAngleDeg(frames[i], SHO, ELB, WRI));
+      }
+      const penElb = 0.2 * Math.max(0, 165 - elb);
+      // racquet peak height near contact — real detections only, since the
+      // blur-gap interpolation can't be trusted for grading
+      let rqPct = null;
+      if (racquet) {
+        for (let i = Math.max(0, C - TUNE.rqContactWindow);
+             i <= Math.min(n - 1, C + TUNE.rqContactWindow); i++) {
+          const r = racquet[i];
+          if (!r || r.interp) continue;
+          const hPct = ((1 - r.head.y) - ground) / reach * 100;
+          if (rqPct === null || hPct > rqPct) rqPct = hPct;
+        }
+      }
+      const penRq = rqPct === null ? 0
+        : TUNE.rqContactSlope * Math.max(0, TUNE.rqContactTarget - rqPct);
+      return {
+        score: finalizeScore(penReach + penElb + penRq),
+        detail: `contact at ${reachPct.toFixed(0)}% of standing reach, elbow ${elb.toFixed(0)}°` +
+          (rqPct === null ? ""
+            : `, racquet head peaked at ${rqPct.toFixed(0)}% (target ≥ ${TUNE.rqContactTarget}%)`)
+      };
+    }
+
+    /* --- 7. Pronation / Wrist Snap (10%) — parked: needs racquet orientation
+     * through contact, which a bounding-box tracker can't see --- */
+    function cpPronation() {
+      return { score: null, detail: "needs racquet orientation through contact" };
+    }
+
+    /* --- 8. Follow-Through (8%) --- */
+    function cpFollowThrough() {
+      // cross-body direction at finish: hitting shoulder -> non-hitting shoulder
+      const a = pt(fF, SHO), b = pt(fF, NSHO);
+      let ux = b.x - a.x, uh = b.h - a.h;
+      const um = Math.hypot(ux, uh) || 1;
+      ux /= um; uh /= um;
+      const hipC = {
+        x: (pt(fF, IDX.L_HIP).x + pt(fF, IDX.R_HIP).x) / 2,
+        h: (pt(fF, IDX.L_HIP).h + pt(fF, IDX.R_HIP).h) / 2
+      };
+      const w = pt(fF, WRI);
+      const cross = ((w.x - hipC.x) * ux + (w.h - hipC.h) * uh) / hipW;
+      const above = (w.h - hipC.h) / hipW;
+      let pen = 5.0 * Math.max(0, -cross) + 2.5 * Math.max(0, above);
+      // abrupt deceleration check: biggest single-frame fractional speed drop
+      let prevSpeed = null, maxDrop = 0;
+      for (let i = C; i <= Math.min(F + 3, n - 1); i++) {
+        if (i === 0) continue;
+        const dt = Math.max(frames[i].t - frames[i - 1].t, 1e-4);
+        const sp = Math.hypot(pt(frames[i], WRI).x - pt(frames[i - 1], WRI).x,
+                              pt(frames[i], WRI).h - pt(frames[i - 1], WRI).h) / dt;
+        if (prevSpeed !== null && prevSpeed > 0.5) {
+          maxDrop = Math.max(maxDrop, (prevSpeed - sp) / prevSpeed);
+        }
+        prevSpeed = sp;
+      }
+      if (maxDrop > 0.8) pen += 1.3;
+      const crossTxt = cross >= 0
+        ? `crossed ${cross.toFixed(1)} hip-widths past midline`
+        : `${(-cross).toFixed(1)} hip-widths short of midline`;
+      return {
+        score: finalizeScore(pen),
+        detail: `${crossTxt}, hand ${Math.abs(above).toFixed(1)} hip-widths ${above >= 0 ? "above" : "below"} hip`
+      };
+    }
+
+    /* --- 9. Landing Balance / Recovery (5%) --- */
+    function cpLanding() {
+      // first stable frame after FINISH: whole-body motion back under threshold
+      const MO = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28];
+      const motion = [0];
+      for (let i = 1; i < n; i++) {
+        let s = 0;
+        for (const k of MO) {
+          s += Math.hypot(frames[i].lm[k].x - frames[i - 1].lm[k].x,
+                          frames[i].lm[k].y - frames[i - 1].lm[k].y);
+        }
+        motion.push(s / MO.length);
+      }
+      motion[0] = motion[1] || 0;
+      const sorted = [...motion].sort((x, y) => x - y);
+      const thr = 0.25 * sorted[Math.min(n - 1, Math.floor(0.9 * n))];
+      let land = Math.min(F + 3, n - 1);
+      for (let i = F; i < n; i++) {
+        if (motion[i] < thr) { land = i; break; }
+      }
+      let sway = 0;
+      const cx = i => (frames[i].lm[IDX.L_HIP].x + frames[i].lm[IDX.R_HIP].x) / 2;
+      for (let i = land; i <= Math.min(land + 3, n - 1); i++) {
+        for (let j = land; j < i; j++) sway = Math.max(sway, Math.abs(cx(i) - cx(j)));
+      }
+      sway /= hipW;
+      const shoe = Math.max(segLen(fS, NHEEL, NFOOT), 1e-3);
+      const drift = Math.abs(pt(frames[land], NANK).x - pt(fS, NANK).x) / shoe;
+      const pen = 6.5 * Math.max(0, sway - 0.25) + 0.4 * Math.max(0, drift - 1.0);
+      return {
+        score: finalizeScore(pen),
+        detail: `landed by ${frames[land].t.toFixed(2)}s, sway ${sway.toFixed(2)} hip-widths, front-foot drift ${drift.toFixed(1)} shoe-lengths`
+      };
+    }
+
+    const checkpoints = [
+      { name: "Setup & Alignment",       weight: 5,  ...cpSetup() },
+      { name: "Ball Toss",               weight: 12, ...cpToss() },
+      { name: "Loading & Trophy",        weight: 20, ...cpLoadTrophy() },
+      { name: "Racket Drop",             weight: 15, ...cpRacketDrop() },
+      { name: "Hip-Shoulder Separation", weight: 12, ...cpSeparation() },
+      { name: "Contact Point",           weight: 13, ...cpContact() },
+      { name: "Pronation / Wrist Snap",  weight: 10, ...cpPronation() },
+      { name: "Follow-Through",          weight: 8,  ...cpFollowThrough() },
+      { name: "Landing Balance",         weight: 5,  ...cpLanding() }
+    ];
+
+    // weighted final over implemented checkpoints only
+    let wSum = 0, sSum = 0;
+    for (const cp of checkpoints) {
+      if (cp.score !== null) { wSum += cp.weight; sSum += cp.weight * cp.score; }
+    }
+    return { checkpoints, final: wSum ? round1(sSum / wSum) : null, scoredWeight: wSum };
+  }
+
+  return { scoreServe };
+})();
+
+function movingAverage(arr, w = 5) {
+  const half = Math.floor(w / 2);
+  const out = new Array(arr.length);
+  for (let i = 0; i < arr.length; i++) {
+    let sum = 0, n = 0;
+    for (let j = Math.max(0, i - half); j <= Math.min(arr.length - 1, i + half); j++) {
+      sum += arr[j]; n++;
+    }
+    out[i] = sum / n;
+  }
+  return out;
+}
+
+function argExtreme(arr, from, to, cmp) {
+  let best = from;
+  for (let i = from; i <= to; i++) if (cmp(arr[i], arr[best])) best = i;
+  return best;
+}
+const argmax = (arr, from, to) => argExtreme(arr, from, to, (a, b) => a > b);
+const argmin = (arr, from, to) => argExtreme(arr, from, to, (a, b) => a < b);
+
+// Standard quadratic (parabolic) peak interpolation: fits a parabola through
+// idx and its two neighbors and returns whichever of idx/idx-1/idx+1 is
+// closer to that parabola's true (continuous, sub-frame) vertex. Corrects
+// the small bias a raw discrete argmax has toward whichever single frame's
+// noisy reading happens to be highest, without pulling in any other signal.
+function refinePeak(arr, idx) {
+  if (idx <= 0 || idx >= arr.length - 1) return idx;
+  const y0 = arr[idx - 1], y1 = arr[idx], y2 = arr[idx + 1];
+  const denom = y0 - 2 * y1 + y2;
+  if (Math.abs(denom) < 1e-9) return idx;
+  const offset = 0.5 * (y0 - y2) / denom; // in (-0.5, 0.5), + means toward idx+1
+  return idx + Math.round(Math.max(-0.5, Math.min(0.5, offset)));
+}
+
+function percentile(arr, p) {
+  const s = [...arr].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.floor(p * s.length))];
+}
+
+function jointAngle(lm, a, b, c) {
+  // angle at b (degrees) between rays b->a and b->c, in image x/y
+  const v1x = lm[a].x - lm[b].x, v1y = lm[a].y - lm[b].y;
+  const v2x = lm[c].x - lm[b].x, v2y = lm[c].y - lm[b].y;
+  const dot = v1x * v2x + v1y * v2y;
+  const mag = Math.hypot(v1x, v1y) * Math.hypot(v2x, v2y);
+  if (mag === 0) return 180;
+  return Math.acos(Math.min(1, Math.max(-1, dot / mag))) * 180 / Math.PI;
+}
+
+function trackRacquet(frames, arm) {
+  const WRI = arm === "right" ? LM.R_WRIST : LM.L_WRIST;
+  const track = frames.map(f => {
+    const w = f.lm[WRI];
+    let best = null, bestD = Infinity;
+    for (const c of f.rq || []) {
+      const d = Math.hypot(c.x + c.w / 2 - w.x, c.y + c.h / 2 - w.y);
+      if (d < bestD) { bestD = d; best = c; }
+    }
+    if (!best || bestD > TUNE.rqMaxWristDist) return null;
+    let head = null, headD = -1;
+    for (const [hx, hy] of [[best.x, best.y], [best.x + best.w, best.y],
+                            [best.x, best.y + best.h], [best.x + best.w, best.y + best.h]]) {
+      const d = Math.hypot(hx - w.x, hy - w.y);
+      if (d > headD) { headD = d; head = { x: hx, y: hy }; }
+    }
+    return {
+      cx: best.x + best.w / 2, cy: best.y + best.h / 2,
+      head, score: best.score, interp: false
+    };
+  });
+  // linearly interpolate interior gaps (leading/trailing misses stay null)
+  let prev = -1;
+  for (let i = 0; i < track.length; i++) {
+    if (!track[i]) continue;
+    if (prev >= 0 && i - prev > 1) {
+      for (let j = prev + 1; j < i; j++) {
+        const a = (j - prev) / (i - prev);
+        const mix = (p, q) => p + (q - p) * a;
+        track[j] = {
+          cx: mix(track[prev].cx, track[i].cx),
+          cy: mix(track[prev].cy, track[i].cy),
+          head: { x: mix(track[prev].head.x, track[i].head.x),
+                  y: mix(track[prev].head.y, track[i].head.y) },
+          score: 0, interp: true
+        };
+      }
+    }
+    prev = i;
+  }
+  return track;
+}
+
+function pickArm(frames, choice) {
+  if (choice !== "auto") return choice;
+  const rTop = Math.max(...frames.map(f => 1 - f.lm[LM.R_WRIST].y));
+  const lTop = Math.max(...frames.map(f => 1 - f.lm[LM.L_WRIST].y));
+  return rTop > lTop ? "right" : "left";
+}
+
+function analyzeServe(frames, arm, racquet = null) {
+  const n = frames.length;
+  const right = arm === "right";
+  const WRIST    = right ? LM.R_WRIST : LM.L_WRIST;
+  const NWRIST   = right ? LM.L_WRIST : LM.R_WRIST;
+  const ELBOW    = right ? LM.R_ELBOW : LM.L_ELBOW;
+  const SHOULDER = right ? LM.R_SHOULDER : LM.L_SHOULDER;
+  const ANKLE    = right ? LM.R_ANKLE : LM.L_ANKLE;
+
+  // --- per-frame signals (normalized coords; height = 1 - y so up is +) ---
+  const wristH    = movingAverage(frames.map(f => 1 - f.lm[WRIST].y));
+  const shoulderH = movingAverage(frames.map(f => 1 - f.lm[SHOULDER].y));
+  const ankleH    = movingAverage(frames.map(f => 1 - f.lm[ANKLE].y));
+  const kneeAngle = movingAverage(frames.map(f =>
+    (jointAngle(f.lm, LM.L_HIP, LM.L_KNEE, LM.L_ANKLE) +
+     jointAngle(f.lm, LM.R_HIP, LM.R_KNEE, LM.R_ANKLE)) / 2
+  ));
+  const elbowAngle = movingAverage(frames.map(f =>
+    jointAngle(f.lm, SHOULDER, ELBOW, WRIST)
+  ));
+  const wristDist = movingAverage(frames.map(f =>
+    Math.hypot(f.lm[LM.L_WRIST].x - f.lm[LM.R_WRIST].x,
+               f.lm[LM.L_WRIST].y - f.lm[LM.R_WRIST].y)
+  ));
+
+  const fps = (n - 1) / Math.max(frames[n - 1].t - frames[0].t, 1e-6);
+
+  // --- CONTACT: hitting arm at its highest point vertically. Wrist height
+  // alone is the whole signal — the racquet is rigidly connected through the
+  // forearm, so this is already an accurate proxy for "racquet also
+  // highest." Three separate attempts at blending racquet detections into
+  // this pick (unbounded argmax, a bounded window, then a tight +/-2 frame
+  // "only nudge to a real detection" guard) have each eventually broken on
+  // real footage outside the 3-clip validation set: when motion blur kills
+  // detection at the true peak frame, the nudge lands on the nearest frame
+  // that *does* have a real detection instead — which can be clearly
+  // earlier/lower, not a small correction. Reverted for good (see
+  // guided-review-flow memory for the specific case that killed this last
+  // attempt, 2026-08-07). Racquet height still feeds the CONTACT SCORE
+  // separately (cpContact's peak-reach-% term) — this is purely about which
+  // frame gets picked. Raw signal, not smoothed — full extension lasts a
+  // frame or two and averaging drags the peak onto a neighbor. ---
+  const armExtV = frames.map(f => f.lm[SHOULDER].y - f.lm[WRIST].y);
+  // Even after refinePeak, the raw peak still lands ~1-2 frames after the
+  // true contact instant on real footage (consistent user report,
+  // 2026-08-12) — rather than re-deriving a better signal (three earlier
+  // racquet-blending attempts above all regressed on real footage), just
+  // shift the pick back by a flat, tunable frame count.
+  const contact = Math.max(0, refinePeak(armExtV, argmax(armExtV, 0, n - 1)) - TUNE.contactFrameBias);
+
+  // --- LOAD/TROPHY: deepest knee bend before contact ---
+  const load = argmin(kneeAngle, 0, contact);
+
+  // --- SETUP: weight completely on the front foot (before the rock back)
+  // with the hands still roughly together. Weight = where the hip center
+  // sits across the stance, 0 = over the back ankle, 1 = over the front
+  // (non-hitting-side) ankle; take the most-forward frame among the
+  // hands-together candidates. ---
+  const FANK = right ? LM.L_ANKLE : LM.R_ANKLE; // front foot = non-hitting side
+  const weightFwd = movingAverage(frames.map(f => {
+    const bx = f.lm[ANKLE].x, fx = f.lm[FANK].x;
+    if (Math.abs(fx - bx) < 1e-3) return 0.5; // feet aligned in image: no signal
+    const w = ((f.lm[LM.L_HIP].x + f.lm[LM.R_HIP].x) / 2 - bx) / (fx - bx);
+    return Math.min(1.5, Math.max(-0.5, w));
+  }));
+  // Setup must predate the toss: once the toss wrist passes shoulder height
+  // the racquet and raised toss arm sit close together overhead, which would
+  // fool the "together" filter into picking the trophy position.
+  const nwristH = movingAverage(frames.map(f => 1 - f.lm[NWRIST].y));
+  const nshoH = movingAverage(frames.map(f =>
+    1 - f.lm[right ? LM.L_SHOULDER : LM.R_SHOULDER].y));
+  let tossGate = load;
+  for (let i = 0; i <= load; i++) {
+    if (nwristH[i] > nshoH[i]) { tossGate = Math.max(0, i - 1); break; }
+  }
+  // Setup must also predate the windup: a pre-serve routine (ball bounces,
+  // grip adjustment) can bring the hands together even more tightly than the
+  // true ready stance, which would otherwise win the "hands together" search
+  // below. The real windup is marked by weightFwd making a sustained move
+  // away from its resting value at frame 0 — find the first such move and
+  // stop the search there.
+  let windupGate = load;
+  for (let i = 1; i <= load - 5; i++) {
+    if (Math.abs(weightFwd[i] - weightFwd[0]) <= 0.15) continue;
+    let sustained = true;
+    for (let j = i; j < i + 5; j++) {
+      if (Math.abs(weightFwd[j] - weightFwd[0]) <= 0.15) { sustained = false; break; }
+    }
+    if (sustained) { windupGate = i; break; }
+  }
+  const setupEnd = Math.min(tossGate, windupGate);
+
+  // "hands together" filter: wrist-to-wrist distance from full-framerate pose
+  // landmarks. The racquet track can't drive this directly — object detection
+  // only fires on a fraction of frames (motion blur, small/edge-on racquet),
+  // so the gaps get linearly interpolated and the resulting racquet-to-wrist
+  // distance is too flat/noisy to localize a precise instant. Real (non-
+  // interpolated) racquet detections are used only as a sanity check: if one
+  // lands far from the tossing wrist, that candidate frame is discarded.
+  //
+  // Take the EARLIEST candidate that clears the gate, not the most
+  // forward-weighted one — weightFwd is still trending through this window
+  // in most clips (rising, falling, or both), so "most forward" tends to
+  // drift to whichever edge of the window has the most extreme value rather
+  // than the true ready stance. Verified against 3 labeled clips: earliest
+  // beats most-forward on all three (see guided-review-flow memory).
+  const dwin = wristDist.slice(0, setupEnd + 1);
+  const dmin = Math.min(...dwin);
+  const dthr = dmin + 0.5 * (percentile(dwin, 0.5) - dmin); // "somewhat" together
+  let setup = 0;
+  for (let i = 0; i <= setupEnd; i++) {
+    if (wristDist[i] > dthr) continue;
+    const r = racquet?.[i];
+    if (r && !r.interp) {
+      const rqDist = Math.hypot(r.cx - frames[i].lm[NWRIST].x,
+                                r.cy - frames[i].lm[NWRIST].y);
+      if (rqDist > TUNE.rqMaxWristDist) continue; // racquet isn't near this hand
+    }
+    setup = i;
+    break;
+  }
+
+  // --- DROP: back-scratch racquet drop. Primary signal is the racquet head
+  // itself — take the lowest (max-y) real, non-interpolated detection in the
+  // load→contact window, since that's literally what "the drop" is. Elbow-
+  // fold (angle bottoms out, then re-extends past 90°) is kept as a fallback
+  // for clips/windows where no real detection lands in that stretch — this
+  // exact window is where detection is documented weakest (edge-on racquet,
+  // fast motion) on the reference clip, so it can't be assumed to always be
+  // covered. Validated against 3 labeled clips: racquet-tip beat the elbow-
+  // fold heuristic on 2 of 3, and was only marginally worse on the third
+  // (0.08s vs 0.02s) — no fallback was needed on any of the three, but the
+  // fallback exists for clips where coverage is worse. ---
+  const fold = contact > load ? argmin(elbowAngle, load, contact) : load;
+  let dropFallback = Math.floor((fold + contact) / 2);
+  for (let i = fold; i <= contact; i++) {
+    if (elbowAngle[i] >= 90) { dropFallback = i; break; }
+  }
+  let drop = dropFallback;
+  if (racquet) {
+    let bestY = -Infinity, found = false;
+    for (let i = load; i <= contact; i++) {
+      const r = racquet[i];
+      if (!r || r.interp) continue;
+      if (r.head.y > bestY) { bestY = r.head.y; drop = i; found = true; }
+    }
+    if (!found) drop = dropFallback;
+  }
+
+  // --- FINISH: follow-through — hitting hand below the shoulder (across the
+  // body) while the hitting-side leg kicks back; take the peak of the
+  // rear-ankle kick within ~1.5 s after contact. ---
+  const hiEnd = Math.min(n - 1, contact + Math.round(1.5 * fps));
+  let finish = n - 1;
+  let bestAnk = -Infinity;
+  for (let i = contact + 1; i <= hiEnd; i++) {
+    if (wristH[i] < shoulderH[i] && ankleH[i] > bestAnk) {
+      bestAnk = ankleH[i];
+      finish = i;
+    }
+  }
+
+  return {
+    arm,
+    keyframes: [
+      { name: "SETUP",       desc: "weight on front foot, hands together",  i: setup },
+      { name: "LOAD/TROPHY", desc: `deepest knee bend (${kneeAngle[load].toFixed(0)}°)`, i: load },
+      { name: "DROP",        desc: "back-scratch racquet drop",             i: drop },
+      { name: "CONTACT",     desc: "max vertical arm extension",            i: contact },
+      { name: "FINISH",      desc: "arm across body, leg kicked back",      i: finish }
+    ]
+  };
+}
+
+/* ============================================================
+ * Guided-review rendering — copied verbatim from pose-viewer.html
+ * (tierOf/TIER_COLOR/roundRectPath/drawCallout/drawStop/
+ * buildReviewStops). Draws the highlighted-part + frosted-glass
+ * callout for one stop at a time; the host app drives which stop
+ * via postMessage instead of a Next button in this page.
+ *
+ * DELIBERATE DIVERGENCE from pose-viewer.html: drawStop/drawCallout here
+ * read frameSource() (a captured still image) instead of the live <video>
+ * element. This is a WebView-only workaround — pose-viewer.html seeks a
+ * blob: URL, which is frame-accurate, so it has no need for this and
+ * should NOT get this block re-copied over it. See frameSource()/
+ * sourceDims() and the "Unresolved bug" note above startReview.
+ * ============================================================ */
+
+const tierOf = s => s === null ? "na" : s >= 7 ? "good" : s >= 4 ? "mid" : "weak";
+const TIER_COLOR = { good: "#34c759", mid: "#ffcc00", weak: "#e02020", na: "#999999" };
+
+function buildReviewStops(frames, kf, arm, scores, racquet) {
+  const right = arm === "right";
+  const SHO  = right ? LM.R_SHOULDER : LM.L_SHOULDER;
+  const ELB  = right ? LM.R_ELBOW : LM.L_ELBOW;
+  const WRI  = right ? LM.R_WRIST : LM.L_WRIST;
+  const NSHO = right ? LM.L_SHOULDER : LM.R_SHOULDER;
+  const NELB = right ? LM.L_ELBOW : LM.R_ELBOW;
+  const NWRI = right ? LM.L_WRIST : LM.R_WRIST;
+  const HIP  = right ? LM.R_HIP : LM.L_HIP;      // hitting side = back leg
+  const KNE  = right ? LM.R_KNEE : LM.L_KNEE;
+  const ANK  = right ? LM.R_ANKLE : LM.L_ANKLE;
+  const FANK = right ? LM.L_ANKLE : LM.R_ANKLE;  // front (landing) ankle
+
+  const cp = name => scores.checkpoints.find(c => c.name === name);
+  const clip10 = v => Math.min(10, Math.max(1, Math.round(v * 10) / 10));
+  const outside = (v, lo, hi) => (v < lo ? lo - v : v > hi ? v - hi : 0);
+  const seg = (f, a, b) => Math.hypot(f.lm[a].x - f.lm[b].x, f.lm[a].y - f.lm[b].y);
+
+  const fS = frames[kf.setup], fL = frames[kf.load], fF = frames[kf.finish];
+  const torso = (seg(fS, LM.L_SHOULDER, LM.L_HIP) +
+                 seg(fS, LM.R_SHOULDER, LM.R_HIP)) / 2;
+
+  // Per-part sub-scores. Unlike the rubric's combined checkpoint scores these
+  // are deliberately uncapped so the highlight color can actually reach red.
+  const knee = (jointAngle(fL.lm, LM.L_HIP, LM.L_KNEE, LM.L_ANKLE) +
+                jointAngle(fL.lm, LM.R_HIP, LM.R_KNEE, LM.R_ANKLE)) / 2;
+  const kneeScore = clip10(10 - TUNE.kneeSlope * outside(knee, TUNE.kneeMin, TUNE.kneeMax));
+
+  const tossElb = jointAngle(fL.lm, NSHO, NELB, NWRI);
+  const tossDev = Math.atan2(
+    Math.abs(fL.lm[NWRI].x - fL.lm[NSHO].x),
+    fL.lm[NSHO].y - fL.lm[NWRI].y   // wrist above shoulder => positive
+  ) * 180 / Math.PI;
+  const tossScore = clip10(10 - TUNE.tossElbSlope * Math.max(0, TUNE.tossElbMin - tossElb)
+                              - TUNE.tossDevSlope * Math.max(0, tossDev - TUNE.tossDevMax));
+
+  // back-leg kick: hitting-side ankle height above the landing ankle, in torso
+  // units (rough calibration — revisit against more clips)
+  const kick = (fF.lm[FANK].y - fF.lm[ANK].y) / torso;
+  const kickScore = clip10(10 - TUNE.kickSlope * Math.max(0, TUNE.kickTarget - kick));
+
+  // racquet position for the DROP highlight: nearest tracked frame within ±3
+  const fD = frames[kf.drop];
+  let rqDrop = null;
+  for (let d = 0; d <= 3 && !rqDrop; d++) {
+    rqDrop = racquet?.[kf.drop + d] ?? racquet?.[kf.drop - d] ?? null;
+  }
+
+  // racquet at CONTACT: only draw a real detection — the blur-gap
+  // interpolation would point the shaft the wrong way mid-swing
+  const fC = frames[kf.contact];
+  let rqContact = null;
+  for (const off of [0, 1, -1]) {
+    const cand = racquet?.[kf.contact + off];
+    if (cand && !cand.interp) { rqContact = cand; break; }
+  }
+
+  const legs = [
+    [LM.L_HIP, LM.L_KNEE], [LM.L_KNEE, LM.L_ANKLE],
+    [LM.R_HIP, LM.R_KNEE], [LM.R_KNEE, LM.R_ANKLE]
+  ];
+  const hitArm = [[SHO, ELB], [ELB, WRI]];
+
+  const mk = (i, title, parts) => ({
+    t: frames[i].t, frame: frames[i], title, parts
+  });
+
+  return [
+    mk(kf.setup, "Setup", [{
+      label: "Stance & alignment",
+      score: cp("Setup & Alignment")?.score ?? null,
+      connections: [...legs, [LM.L_HIP, LM.R_HIP], [LM.L_WRIST, LM.R_WRIST]],
+      joints: [LM.L_KNEE, LM.R_KNEE, LM.L_ANKLE, LM.R_ANKLE, LM.L_WRIST, LM.R_WRIST],
+      advice: {
+        good: "Good stance",
+        mid:  "OK stance",
+        weak: "Bad stance"
+      },
+      rec: "Set up a consistent platform: feet about shoulder-width, front foot pointed toward the net post, shoulders lined up with your stance. A repeatable setup makes every later checkpoint easier to hit."
+    }]),
+    mk(kf.load, "Load / Trophy", [{
+      label: "Knee bend",
+      score: kneeScore,
+      connections: legs,
+      joints: [LM.L_KNEE, LM.R_KNEE],
+      advice: {
+        good: "Good knee bend",
+        mid:  "OK knee bend",
+        weak: "Bad knee bend"
+      },
+      rec: "Your legs are the engine of the serve. At the trophy position sink into roughly a 115–135° knee bend and drive up through the ball — without the leg drive you're serving with arm alone."
+    }, {
+      label: "Toss arm",
+      score: tossScore,
+      connections: [[NSHO, NELB], [NELB, NWRI]],
+      joints: [NELB, NWRI],
+      advice: {
+        good: "Good toss arm",
+        mid:  "OK toss arm",
+        weak: "Bad toss arm"
+      },
+      rec: "Keep the tossing arm fully extended and leave it up until the racquet drops. Bending or dropping it early tilts the shoulders down and pulls your contact point lower."
+    }]),
+    mk(kf.drop, "Racquet Drop", [{
+      label: "Racquet drop",
+      score: cp("Racket Drop")?.score ?? null,
+      connections: hitArm,
+      joints: [ELB, WRI],
+      extraLines: rqDrop ? [[{ x: fD.lm[WRI].x, y: fD.lm[WRI].y }, rqDrop.head]] : [],
+      extraPoints: rqDrop ? [rqDrop.head] : [],
+      advice: {
+        good: "Good drop",
+        mid:  "OK drop",
+        weak: "Bad drop",
+        na:   "Not tracked"
+      },
+      rec: "A full racquet drop is where the serve's whip comes from. At the deepest point the racquet head should hang well below your wrist, down your back — relax the arm and let gravity drop it before you drive up to contact."
+    }]),
+    mk(kf.contact, "Contact", [{
+      label: "Arm extension",
+      score: cp("Contact Point")?.score ?? null,
+      connections: hitArm,
+      joints: [SHO, ELB, WRI],
+      extraLines: rqContact ? [[{ x: fC.lm[WRI].x, y: fC.lm[WRI].y }, rqContact.head]] : [],
+      extraPoints: rqContact ? [rqContact.head] : [],
+      advice: {
+        good: "Good extension",
+        mid:  "OK extension",
+        weak: "Bad extension"
+      },
+      rec: "Meet the ball at full stretch — contact near 100% of your standing reach with the elbow fully extended. Reaching up, not out, is what buys both power and net clearance."
+    }]),
+    mk(kf.finish, "Follow-Through", [{
+      label: "Cross-body swing",
+      score: cp("Follow-Through")?.score ?? null,
+      connections: hitArm,
+      joints: [ELB, WRI],
+      advice: {
+        good: "Good follow-through",
+        mid:  "OK follow-through",
+        weak: "Bad follow-through"
+      },
+      rec: "After contact, let the racquet arm release diagonally across your body toward the opposite hip. Cutting the swing short bleeds racquet-head speed and loads the shoulder."
+    }, {
+      label: "Back-leg kick",
+      score: kickScore,
+      connections: [[HIP, KNE], [KNE, ANK]],
+      joints: [KNE, ANK],
+      advice: {
+        good: "Good leg kick",
+        mid:  "OK leg kick",
+        weak: "Bad leg kick"
+      },
+      rec: "Land on the front foot and let the back leg kick back behind you as a counterbalance. If it stays planted, you're probably not driving up and into the court."
+    }])
+  ];
+}
+
+// Rounded-rect path helper (builds the path only — caller fills/strokes it).
+function roundRectPath(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+// Leader line + frosted-glass label chip pointing at a highlighted body
+// part, telestrator-style. stackIndex spaces out multiple callouts in the
+// same stop; scale keeps the label a consistent on-screen size regardless
+// of the source video's native resolution.
+function drawCallout(anchor, text, stackIndex, scale) {
+  const leadLen = 60 * scale;
+  const dir = anchor.x < canvas.width / 2 ? -1 : 1;
+  const leadX = anchor.x + dir * leadLen;
+  const leadY = Math.max(34 * scale, anchor.y - leadLen - stackIndex * 46 * scale);
+
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
+  ctx.lineWidth = 2 * scale;
+  ctx.beginPath();
+  ctx.moveTo(anchor.x, anchor.y);
+  ctx.lineTo(leadX, leadY);
+  ctx.stroke();
+
+  const fontPx = Math.round(19 * scale);
+  ctx.font = `700 ${fontPx}px -apple-system, BlinkMacSystemFont, sans-serif`;
+  const padX = 12 * scale, h = fontPx + 16 * scale;
+  const w = ctx.measureText(text).width + padX * 2;
+  const boxX = Math.min(Math.max(dir > 0 ? leadX : leadX - w, 4), canvas.width - w - 4);
+  const boxY = Math.min(Math.max(leadY - h / 2, 4), canvas.height - h - 4);
+  const r = 10 * scale;
+
+  // Frosted-glass chip: blur+darken the frame showing through the box (not a
+  // flat fill), then a heavy white fog tint over it so the frame underneath
+  // is barely legible — like condensation on glass, not a see-through pane.
+  // Sampled from frameSource() (the captured still during a review stop, the
+  // live video otherwise) so the blur reflects the same frame drawStop just
+  // painted, not whatever the live <video> happens to be showing.
+  ctx.save();
+  roundRectPath(boxX, boxY, w, h, r);
+  ctx.clip();
+  ctx.filter = `blur(${18 * scale}px) saturate(1.3) brightness(0.4)`;
+  const pad = 24 * scale; // oversample past the clip so blur doesn't smear in transparent edge pixels
+  const src = frameSource();
+  const { w: srcW, h: srcH } = sourceDims(src);
+  const sxScale = srcW / canvas.width, syScale = srcH / canvas.height;
+  ctx.drawImage(
+    src,
+    (boxX - pad) * sxScale, (boxY - pad) * syScale, (w + pad * 2) * sxScale, (h + pad * 2) * syScale,
+    boxX - pad, boxY - pad, w + pad * 2, h + pad * 2
+  );
+  ctx.filter = "none";
+  ctx.fillStyle = "rgba(255, 255, 255, 0.65)";
+  ctx.fillRect(boxX, boxY, w, h);
+  ctx.restore();
+
+  roundRectPath(boxX, boxY, w, h, r);
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.55)";
+  ctx.lineWidth = scale;
+  ctx.stroke();
+
+  // shadow keeps the white text legible now that the fog reads much lighter
+  ctx.save();
+  ctx.shadowColor = "rgba(0, 0, 0, 0.65)";
+  ctx.shadowBlur = 6 * scale;
+  ctx.fillStyle = "#fff";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, boxX + padX, boxY + h / 2 + fontPx * 0.03);
+  ctx.restore();
+}
+
+function drawStop(stop) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  // Paint the checkpoint frame itself onto the canvas rather than relying on
+  // the live <video> element showing through underneath — see frameSource().
+  const src = frameSource();
+  const { w: srcW, h: srcH } = sourceDims(src);
+  ctx.drawImage(src, 0, 0, srcW, srcH, 0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = "rgba(0, 0, 0, 0.35)"; // dim the frame so highlights pop
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const scale = canvas.height / 720; // reference: IMG_0287's native height
+  const lm = stop.frame.lm;
+  const X = k => lm[k].x * canvas.width;
+  const Y = k => lm[k].y * canvas.height;
+  const px = p => p.x * canvas.width, py = p => p.y * canvas.height;
+
+  stop.parts.forEach((part, i) => {
+    const tier = tierOf(part.score);
+    const color = TIER_COLOR[tier];
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 6 * scale;
+    ctx.lineCap = "round";
+    for (const [a, b] of part.connections) {
+      ctx.beginPath();
+      ctx.moveTo(X(a), Y(a));
+      ctx.lineTo(X(b), Y(b));
+      ctx.stroke();
+    }
+    ctx.fillStyle = color;
+    for (const k of part.joints) {
+      ctx.beginPath();
+      ctx.arc(X(k), Y(k), 7 * scale, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // free-floating extras (e.g. the racquet shaft/head, which aren't landmarks)
+    for (const [a, b] of part.extraLines ?? []) {
+      ctx.beginPath();
+      ctx.moveTo(px(a), py(a));
+      ctx.lineTo(px(b), py(b));
+      ctx.stroke();
+    }
+    for (const p of part.extraPoints ?? []) {
+      ctx.beginPath();
+      ctx.arc(px(p), py(p), 9 * scale, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    let anchor;
+    if (part.joints.length) {
+      let sx = 0, sy = 0;
+      for (const k of part.joints) { sx += X(k); sy += Y(k); }
+      anchor = { x: sx / part.joints.length, y: sy / part.joints.length };
+    } else if (part.extraPoints?.length) {
+      anchor = { x: px(part.extraPoints[0]), y: py(part.extraPoints[0]) };
+    } else {
+      anchor = { x: canvas.width / 2, y: canvas.height / 2 };
+    }
+    drawCallout(anchor, part.advice[tier] ?? part.advice.na, i, scale);
+  });
+}
+
+/* ============================================================
+ * Headless runner — drives the models over the video and, when
+ * asked, the guided review above. Talks to the host app over
+ * postMessage instead of reading/writing any other DOM controls.
+ * ============================================================ */
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("overlay");
+const ctx = canvas.getContext("2d");
+let landmarker = null;
+let racquetDetector = null;
+let lastDetectTime = -1;
+let busy = false;
+
+// Reused offscreen canvas for capturing a downscaled still of each analyzed
+// frame (see onFrame below) — kept small since only the 5 checkpoint frames
+// survive past runAnalysis (see the prune step after keyframes are known).
+const SNAP_MAX_DIM = 480;
+const snapCanvas = document.createElement("canvas");
+const snapCtx = snapCanvas.getContext("2d");
+
+// Kept from the most recent analysis pass so startReview can run without
+// re-analyzing: the review just replays/highlights already-computed data.
+let lastFrames = null;
+let lastArm = null;
+let lastKfIdx = null;
+let lastScores = null;
+let lastRacquetTrack = null;
+let lastTrimStart = 0;
+
+let isReviewing = false;
+let reviewStops = [];
+let reviewIdx = 0;
+
+// The decoded still image for the checkpoint frame currently being shown
+// (see "Unresolved bug" note above startReview) — null outside a stop, in
+// which case frameSource() falls back to the live video.
+let reviewFrameImg = null;
+function frameSource() { return reviewFrameImg || video; }
+function sourceDims(src) {
+  return src === video ? { w: video.videoWidth, h: video.videoHeight }
+                        : { w: src.naturalWidth, h: src.naturalHeight };
+}
+function loadImage(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = dataUrl;
+  });
+}
+
+function post(msg) {
+  if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify(msg));
+  else window.parent?.postMessage(msg, "*"); // lets engine.html be smoke-tested in a plain browser tab
+}
+
+async function loadModels() {
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  landmarker = await PoseLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numPoses: 1
+  });
+  try {
+    racquetDetector = await ObjectDetector.createFromOptions(fileset, {
+      baseOptions: {
+        modelAssetPath:
+          "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float16/1/efficientdet_lite2.tflite",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO",
+      scoreThreshold: 0.15,
+      categoryAllowlist: ["tennis racket"]
+    });
+  } catch (err) {
+    // Racquet tracking is optional — Racket Drop and part of Contact Point
+    // grading degrade to null/pose-only, same as pose-viewer.html.
+    console.error("racquet detector failed to load:", err);
+  }
+  post({ type: "ready" });
+}
+
+function waitForVideoLoad() {
+  return new Promise((resolve, reject) => {
+    const onLoaded = () => {
+      // native resolution, not CSS size — landmark coords are normalized
+      // against this, and drawStop/drawCallout read it back via canvas.width/height.
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      cleanup(); resolve();
+    };
+    const onError = () => { cleanup(); reject(new Error("video failed to load")); };
+    function cleanup() {
+      video.removeEventListener("loadedmetadata", onLoaded);
+      video.removeEventListener("error", onError);
+    }
+    video.addEventListener("loadedmetadata", onLoaded, { once: true });
+    video.addEventListener("error", onError, { once: true });
+  });
+}
+
+// Fixed sampling rate for the analysis capture pass (see runAnalysis).
+// Deliberately independent of the source clip's own frame rate — seeking to
+// the same target timestamp on the same file always lands on the same
+// decoded frame, so this makes analysis of a given clip 100% reproducible
+// run to run, unlike real-time-playback capture (see runAnalysis comment).
+const SAMPLE_FPS = 30;
+
+// Seek to an exact timestamp and wait for the frame to actually be there —
+// used instead of real-time playback for the analysis capture pass. The
+// timeout is only a hang-prevention safety net (e.g. a decoder hiccup on
+// one frame) — it doesn't run in the normal case and so doesn't reintroduce
+// the run-to-run variance this whole approach exists to avoid.
+function seekTo(t) {
+  return new Promise(resolve => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      video.removeEventListener("seeked", done);
+      resolve();
+    };
+    video.addEventListener("seeked", done, { once: true });
+    video.currentTime = t;
+    setTimeout(done, 2000);
+  });
+}
+
+async function runAnalysis({ videoSrc, arm, serveType, trimStart, trimEnd }) {
+  const recorded = [];
+  video.src = videoSrc;
+  await waitForVideoLoad();
+
+  // Soft trim: no file is cut, this just narrows the sampled range to
+  // [trimStart, trimEnd] (set by the host app's trim screen) instead of the
+  // full clip. Defensive fallback to the whole clip if the bounds are
+  // missing/invalid, so this never silently analyzes zero frames.
+  const start = Math.max(0, trimStart || 0);
+  const end = (typeof trimEnd === "number" && trimEnd > start)
+    ? Math.min(video.duration, trimEnd)
+    : video.duration;
+  lastTrimStart = start;
+
+  // Captures landmarks by stepping through the clip at a fixed, deterministic
+  // set of timestamps (seek -> detect -> next timestamp) instead of playing
+  // it in real time and reacting to requestVideoFrameCallback/
+  // requestAnimationFrame ticks. The old real-time approach meant the *set
+  // of frames actually analyzed* depended on how fast pose detection kept up
+  // with playback on a given run — under more system load, more frames get
+  // skipped between callbacks — so the same clip could produce a different
+  // `recorded` array, and therefore different checkpoint times, from one
+  // analysis to the next. Stepping through fixed timestamps instead means
+  // the same clip always gets analyzed at the same instants regardless of
+  // device speed — slower just means the pass takes longer, not a
+  // different result.
+  const span = Math.max(0, end - start);
+  const step = 1 / SAMPLE_FPS;
+  const totalSteps = Math.max(1, Math.floor(span / step));
+  let lastPct = -1;
+  for (let i = 0; i <= totalSteps; i++) {
+    const t = Math.min(start + i * step, end - 1e-3);
+    await seekTo(t);
+
+    let ts = performance.now();
+    if (ts <= lastDetectTime) ts = lastDetectTime + 1;
+    lastDetectTime = ts;
+
+    const result = landmarker.detectForVideo(video, ts);
+    if (result.landmarks.length) {
+      const entry = { t: video.currentTime, lm: result.landmarks[0], rq: [] };
+      // Snapshot now, at the exact instant these landmarks were detected —
+      // used later by the guided review to draw the checkpoint frame
+      // exactly, instead of re-seeking the video (see the "Unresolved bug"
+      // note near startReview for why re-seeking a data: URI in a WebView
+      // isn't precise enough for that). Most entries get pruned once the 5
+      // keyframes are known.
+      const snapScale = Math.min(1, SNAP_MAX_DIM / Math.max(video.videoWidth, video.videoHeight));
+      snapCanvas.width = Math.max(1, Math.round(video.videoWidth * snapScale));
+      snapCanvas.height = Math.max(1, Math.round(video.videoHeight * snapScale));
+      snapCtx.drawImage(video, 0, 0, snapCanvas.width, snapCanvas.height);
+      entry.img = snapCanvas.toDataURL("image/jpeg", 0.7);
+      if (racquetDetector) {
+        for (const d of racquetDetector.detectForVideo(video, ts).detections) {
+          entry.rq.push({
+            x: d.boundingBox.originX / video.videoWidth,
+            y: d.boundingBox.originY / video.videoHeight,
+            w: d.boundingBox.width / video.videoWidth,
+            h: d.boundingBox.height / video.videoHeight,
+            score: d.categories[0]?.score ?? 0
+          });
+        }
+      }
+      recorded.push(entry);
+    }
+    const pct = Math.round((i / totalSteps) * 90); // reserve 90-100 for scoring
+    if (pct !== lastPct) { lastPct = pct; post({ type: "progress", stage: "tracking", percent: pct }); }
+  }
+
+  if (recorded.length < 10) {
+    post({ type: "error", message: `Only ${recorded.length} frames with a detected pose — not enough to analyze.` });
+    return;
+  }
+
+  post({ type: "progress", stage: "scoring", percent: 92 });
+  const pickedArm = pickArm(recorded, arm ?? "auto");
+  const racquetTrack = recorded.some(f => f.rq && f.rq.length)
+    ? trackRacquet(recorded, pickedArm)
+    : null;
+  const result = analyzeServe(recorded, pickedArm, racquetTrack);
+  const kfByName = {};
+  for (const kf of result.keyframes) kfByName[kf.name] = kf.i;
+  const kfIdx = {
+    setup:   kfByName["SETUP"],
+    load:    kfByName["LOAD/TROPHY"],
+    drop:    kfByName["DROP"],
+    contact: kfByName["CONTACT"],
+    finish:  kfByName["FINISH"]
+  };
+  const scores = ServeScoring.scoreServe(recorded, kfIdx, pickedArm, serveType ?? "flat", racquetTrack);
+
+  // Only the 5 checkpoint frames are ever shown in the guided review — drop
+  // the rest of the captured stills now so they don't sit in memory for the
+  // whole review session (base64 JPEGs across 100+ frames adds up).
+  const keepImg = new Set(Object.values(kfIdx));
+  recorded.forEach((f, i) => { if (!keepImg.has(i)) delete f.img; });
+
+  lastFrames = recorded;
+  lastArm = pickedArm;
+  lastKfIdx = kfIdx;
+  lastScores = scores;
+  lastRacquetTrack = racquetTrack;
+
+  post({ type: "progress", stage: "scoring", percent: 98 });
+  post({
+    type: "result",
+    arm: pickedArm,
+    keyframes: result.keyframes,
+    checkpoints: scores.checkpoints,
+    final: scores.final,
+    scoredWeight: scores.scoredWeight,
+    frameCount: recorded.length,
+    durationSec: video.duration
+  });
+}
+
+/* ---------------- Guided review playback ----------------
+ * Ported from pose-viewer.html's startReview/reviewLoop/showStop/endReview,
+ * minus the DOM-driven chrome (title text, Next/Skip buttons, disabling
+ * other controls) — the host app owns that UI and drives this over
+ * postMessage instead. Runs against lastFrames/lastScores/etc from the most
+ * recent runAnalysis() call; no re-analysis needed. */
+
+function startReview() {
+  if (!lastFrames) { post({ type: "error", message: "No analysis to review yet" }); return; }
+  reviewStops = buildReviewStops(lastFrames, lastKfIdx, lastArm, lastScores, lastRacquetTrack);
+  isReviewing = true;
+  reviewIdx = 0;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  video.currentTime = lastTrimStart; // start of the trimmed window, not necessarily 0
+  video.playbackRate = 0.5; // slow-mo replay so the stops flow naturally
+  video.play().then(() => {
+    if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(reviewLoop);
+    else requestAnimationFrame(reviewLoop);
+  });
+}
+
+function reviewLoop() {
+  if (!isReviewing) return;
+  // Check the stop condition before bailing on paused/ended: FINISH is often
+  // right at the clip's natural end, so 'ended' can land at or before the
+  // frame that would otherwise catch it.
+  const stop = reviewStops[reviewIdx];
+  if (stop && video.currentTime >= stop.t) {
+    video.pause();
+    video.currentTime = stop.t; // snap the display to the checkpoint frame
+    showStop(stop);
+    return;
+  }
+  if (video.paused || video.ended) return;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(reviewLoop);
+  else requestAnimationFrame(reviewLoop);
+}
+
+function showStop(stop) {
+  // Don't draw from the live <video> element at all: on a WebView playing a
+  // data: URI, video.currentTime = stop.t doesn't reliably land on the exact
+  // frame (seeking snaps forward to whatever the decoder has ready), so the
+  // overlay ends up correctly positioned for stop.t while the video visibly
+  // shows a later frame. Waiting for `seeked` (tried previously) didn't fix
+  // this because the seek itself lands wrong, not just late.
+  // Instead, draw the still image captured for this exact frame during the
+  // analysis pass (see onFrame's entry.img) — guaranteed to match the
+  // landmarks pixel-for-pixel since both came from the same instant.
+  reviewFrameImg = null;
+  loadImage(stop.frame.img)
+    .then(img => { reviewFrameImg = img; })
+    .catch(() => { reviewFrameImg = null; }) // fall back to live video if decode fails
+    .then(() => { if (isReviewing) drawStop(stop); });
+  post({ type: "reviewStop", index: reviewIdx, total: reviewStops.length, title: stop.title });
+}
+
+function reviewAdvance() {
+  if (!isReviewing) return;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  reviewIdx++;
+  if (reviewIdx >= reviewStops.length) { endReview(); return; }
+  video.play().then(() => {
+    if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(reviewLoop);
+    else requestAnimationFrame(reviewLoop);
+  });
+}
+
+function endReview() {
+  isReviewing = false;
+  reviewFrameImg = null;
+  video.pause();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  post({ type: "reviewDone" });
+}
+
+function handleMessage(event) {
+  let data = event.data;
+  try { if (typeof data === "string") data = JSON.parse(data); } catch { return; }
+  if (!data) return;
+  if (data.type === "startReview") { startReview(); return; }
+  if (data.type === "reviewNext") { reviewAdvance(); return; }
+  if (data.type !== "analyze") return;
+  if (busy) return;
+  busy = true;
+  runAnalysis(data).catch(err => {
+    post({ type: "error", message: err?.message ?? String(err) });
+  }).finally(() => { busy = false; });
+}
+
+// react-native-webview delivers postMessage on `document` on Android and
+// `window` on iOS — listen on both.
+document.addEventListener("message", handleMessage);
+window.addEventListener("message", handleMessage);
+
+loadModels().catch(err => post({ type: "error", message: "Failed to load models: " + (err?.message ?? err) }));
+</script>
+</body>
+</html>
