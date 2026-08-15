@@ -76,7 +76,8 @@ const TUNE = {
   rqContactWindow: 5,     // frames around contact searched for the racquet peak (grading only)
   rqContactTarget: 85,    // racquet peak as % of standing reach near contact
   rqContactSlope: 0.42,   // penalty per % short of rqContactTarget
-  contactFrameBias: 0     // flat frame shift applied to the detected CONTACT frame (see analyzeServe) — even 1 frame overshot on low-fps clips, back to the raw pick
+  contactFrameBias: 0,    // flat frame shift applied to the detected CONTACT frame (see analyzeServe) — even 1 frame overshot on low-fps clips, back to the raw pick
+  contactMinKnee: 140     // CONTACT candidates must have at least this much knee extension (degrees) -- checked against 10 real clips' validated CONTACT frames (all >=164°), set well below that floor for margin, but far above the ~86-106° a mid-load landmark glitch reads at
 };
 
 /* ---------------- Serve scoring (rubric v0.1) ---------------- */
@@ -496,6 +497,16 @@ function analyzeServe(frames, arm, racquet = null) {
 
   const fps = (n - 1) / Math.max(frames[n - 1].t - frames[0].t, 1e-6);
 
+  const armExtV = frames.map(f => f.lm[SHOULDER].y - f.lm[WRIST].y);
+
+  // --- LOAD/TROPHY: deepest knee bend, searched over the WHOLE clip (not
+  // bounded by contact — see below for why). Verified against 11 real clips
+  // (2026-08-14, user bug report): the deepest knee bend never occurs after
+  // the true contact instant in any of them (no landing-squat ever out-bends
+  // the trophy position), so searching unbounded is safe and doesn't need a
+  // contact estimate to know where to stop. ---
+  const load = argmin(kneeAngle, 0, n - 1);
+
   // --- CONTACT: hitting arm at its highest point vertically. Wrist height
   // alone is the whole signal — the racquet is rigidly connected through the
   // forearm, so this is already an accurate proxy for "racquet also
@@ -510,17 +521,38 @@ function analyzeServe(frames, arm, racquet = null) {
   // attempt, 2026-08-07). Racquet height still feeds the CONTACT SCORE
   // separately (cpContact's peak-reach-% term) — this is purely about which
   // frame gets picked. Raw signal, not smoothed — full extension lasts a
-  // frame or two and averaging drags the peak onto a neighbor. ---
-  const armExtV = frames.map(f => f.lm[SHOULDER].y - f.lm[WRIST].y);
-  // Even after refinePeak, the raw peak still lands ~1-2 frames after the
-  // true contact instant on real footage (consistent user report,
-  // 2026-08-12) — rather than re-deriving a better signal (three earlier
-  // racquet-blending attempts above all regressed on real footage), just
-  // shift the pick back by a flat, tunable frame count.
-  const contact = Math.max(0, refinePeak(armExtV, argmax(armExtV, 0, n - 1)) - TUNE.contactFrameBias);
-
-  // --- LOAD/TROPHY: deepest knee bend before contact ---
-  const load = argmin(kneeAngle, 0, contact);
+  // frame or two and averaging drags the peak onto a neighbor.
+  //
+  // Search is bounded to start at LOAD (2026-08-14, real user bug report:
+  // "trophy, drop, and extension all in the same frames"). armExtV is raw/
+  // unsmoothed by design, which makes it vulnerable to a 1-2 frame landmark
+  // glitch during the load-to-trophy transition, where the wrist and
+  // shoulder landmarks pass close together and are most easily confused —
+  // confirmed on the reported clip: a transient wrist/shoulder tracking blip
+  // at t=1.3s (knee still at 106°, clearly mid-load) scored higher than the
+  // true contact peak at t=1.73s (knee 170°+, i.e. driving up into the
+  // ball), because at true contact the whole body also rises (jumping into
+  // the shot), which lifts the shoulder almost as much as the wrist and
+  // nets a smaller raw shoulder-to-wrist gap than the noise spike. Bounding
+  // the search to [load, n-1] excludes any pre-load glitch by construction
+  // — contact can never happen before the deepest knee bend in a real serve
+  // — and was a no-op on the other 10 already-validated clips (their
+  // unbounded pick already landed after load anyway).
+  //
+  // That window bound alone isn't quite enough, though: a glitch can also
+  // land shortly *after* load, before the knee has actually re-extended
+  // (found on a second real clip the same session — a one-frame wrist
+  // landmark jump scored higher than the true peak while the knee still
+  // read 86°). So also gate candidates on knee extension — real contact
+  // always happens during the leg drive-up, never while still deep in the
+  // load bend. Checked against all 10 already-validated clips: every one's
+  // true CONTACT frame has knee >= 164°, so contactMinKnee (140) has ample
+  // margin and doesn't touch any of them. ---
+  const armExtVGated = armExtV.map((v, i) =>
+    (i >= load && kneeAngle[i] >= TUNE.contactMinKnee) ? v : -Infinity);
+  let contactIdx = argmax(armExtVGated, load, n - 1);
+  if (armExtVGated[contactIdx] === -Infinity) contactIdx = argmax(armExtV, load, n - 1); // safety net: should never trigger given the margin above
+  const contact = Math.max(load, refinePeak(armExtV, contactIdx) - TUNE.contactFrameBias);
 
   // --- SETUP: weight completely on the front foot (before the rock back)
   // with the hands still roughly together. Weight = where the hip center
@@ -603,8 +635,16 @@ function analyzeServe(frames, arm, racquet = null) {
   // fallback was needed on any of the three, but the fallback exists for
   // clips where coverage is worse. ---
   const fold = contact > load ? argmin(elbowAngle, load, contact) : load;
-  let dropFallback = Math.floor((fold + contact) / 2);
-  for (let i = fold; i <= contact; i++) {
+  // Default to fold itself (the most-folded elbow frame — a real, physically
+  // meaningful "back-scratch" instant) rather than an arbitrary midpoint.
+  // 2026-08-14 real-clip fix: some players never re-extend past 90° until
+  // right at contact, so the old "first re-extension" search would run off
+  // the end and leave dropFallback stuck at the midpoint (or, worse, at
+  // contact itself — colliding with the CONTACT keyframe). Bounding the loop
+  // to `< contact` instead of `<= contact` guarantees this fallback can never
+  // equal CONTACT either.
+  let dropFallback = fold;
+  for (let i = fold; i < contact; i++) {
     if (elbowAngle[i] >= 90) { dropFallback = i; break; }
   }
   let drop = dropFallback;
@@ -639,10 +679,29 @@ function analyzeServe(frames, arm, racquet = null) {
       for (let k = 0; k < real.length - 2; k++) {
         if (real[k + 1].y > real[k].y && real[k + 2].y > real[k].y) { apexIdx = k; break; }
       }
-      let bestY = -Infinity;
+      let bestY = -Infinity, bestI = -1;
       for (let k = apexIdx; k < real.length; k++) {
-        if (real[k].y > bestY) { bestY = real[k].y; drop = real[k].i; }
+        if (real[k].y > bestY) { bestY = real[k].y; bestI = real[k].i; }
       }
+      // Only trust the racquet-driven pick when it lands strictly between
+      // LOAD and CONTACT — the back-scratch drop can't coincide with either
+      // endpoint physically. 2026-08-14 real-clip fixes (two distinct real
+      // clips, same session):
+      // 1. When the window has too few real detections to search (the
+      //    sustained-rise loop above needs >= 3 to ever trigger) OR the real
+      //    detections trend monotonically across the whole window (no
+      //    genuine rise-then-drop shape — e.g. the racquet head appears to
+      //    keep rising the whole way to contact), the loop's default
+      //    apexIdx=0 makes `bestY` degenerate to whichever detection is
+      //    closest to `load` — landing DROP exactly on LOAD.
+      // 2. Symmetric failure at the other end: on a clip where racquet
+      //    detection during the actual drop is weak/interpolated, the
+      //    "sustained rise" the loop found was really just where detection
+      //    coverage resumed near CONTACT (not a real drop-then-rise), and
+      //    the subsequent bestY search landed DROP exactly on CONTACT.
+      // Both keep the elbow-fold fallback above instead of trusting a pick
+      // that isn't actually inside the window.
+      if (bestI > load && bestI < contact) drop = bestI;
     }
   }
 
